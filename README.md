@@ -6,8 +6,6 @@ It re-flashes a module's application **over USB**, with no programmer and no SWD
 cable, driven by the host (PC now; Pico / noknok app later). The application
 update flow mirrors the I2C modules: `ERASE → WRITE → VERIFY(CRC32) → BOOT`.
 
-> **Private** until the USB products launch (per the noknok IP strategy).
-
 ## Why a custom bootloader (and not the WCH factory ROM bootloader)
 
 The CH32V203 has a factory USB bootloader in ROM (`0x1FFF8000`, the one

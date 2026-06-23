@@ -1,0 +1,11 @@
+# build artifacts
+*.o
+*.elf
+*.lst
+*.map
+*.hex
+generated_*.ld
+
+# ignore .bin everywhere except the distributable bootloader image
+*.bin
+!firmware/bin/*.bin

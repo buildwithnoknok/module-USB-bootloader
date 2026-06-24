@@ -1,7 +1,7 @@
 <#
   usb_flash.ps1 - OTA-flash a noknok USB module over USB via the noknok USB bootloader.
 
-  Mirrors the I2C module_flasher flow: detect the bootloader (VID 1209 / PID 4E4F),
+  Mirrors the I2C module_flasher flow: detect the bootloader (VID 1209 / PID 4E42),
   ERASE the app region, stream the .bin in WRITE chunks, VERIFY (CRC32), then BOOT.
   If the module is running the application (PID 4E4E) it is told to enter the
   bootloader first (command 0xB0).
@@ -22,7 +22,7 @@ param(
 
 $VID            = 'VID_1209'
 $PID_APP        = 'PID_4E4E'
-$PID_BOOTLOADER = 'PID_4E4F'
+$PID_BOOTLOADER = 'PID_4E42'
 
 if (-not (Test-Path $Bin)) { Write-Error "bin not found: $Bin"; exit 1 }
 $image = [System.IO.File]::ReadAllBytes($Bin)
@@ -93,7 +93,7 @@ if (-not $Port) {
         }
     }
 }
-if (-not $Port) { Write-Error "noknok USB bootloader (PID 4E4F) not found."; exit 1 }
+if (-not $Port) { Write-Error "noknok USB bootloader (PID 4E42) not found."; exit 1 }
 Write-Host "Bootloader on $Port"
 
 $fs = [NkCom]::Open($Port)

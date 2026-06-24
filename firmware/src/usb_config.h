@@ -12,11 +12,11 @@
 
 #include "usb_defines.h"
 
-/* Bootloader identity: distinct PID (app = 0x4E4E, bootloader = 0x4E4F) so the
+/* Bootloader identity: distinct PID (app = 0x4E4E "NN", bootloader = 0x4E42 "NB") so the
  * host auto-detects "in bootloader mode". Unique iSerialNumber (chip UID) is
  * built at runtime, so a module keeps the same serial across app and bootloader. */
 #define FUSB_USB_VID 0x1209
-#define FUSB_USB_PID 0x4e4f
+#define FUSB_USB_PID 0x4e42
 #define FUSB_USB_REV 0x0100
 #define FUSB_STR_MANUFACTURER u"noknok"
 #define FUSB_STR_PRODUCT      u"noknok USB bootloader"

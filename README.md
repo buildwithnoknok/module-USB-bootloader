@@ -43,8 +43,8 @@ it to the real `0x08002000` and jumps to `0x00002000`. The top 16 B of RAM
 
 ## Identity
 
-The bootloader enumerates as a CDC device **VID `0x1209` / PID `0x4E4F`**
-(the app is `0x4E4E`), product string `noknok USB bootloader`, with the same
+The bootloader enumerates as a CDC device **VID `0x1209` / PID `0x4E42`** ("NB")
+(the app is `0x4E4E` "NN"), product string `noknok USB bootloader`, with the same
 unique chip-UID serial as the app — so the host can match a module across both.
 
 ## Flashing protocol (CDC; host waits for each `[state, err]` reply)
@@ -96,7 +96,7 @@ After that, all application updates are OTA over USB — no SWD, no jumper.
 powershell -ExecutionPolicy Bypass -File tools/usb_flash.ps1 -Bin path\to\app.bin
 ```
 
-The flasher auto-detects the bootloader (PID `4E4F`). If the module is running
+The flasher auto-detects the bootloader (PID `4E42`). If the module is running
 the application (PID `4E4E`) it first sends `0xB0 ENTER_BOOTLOADER`, which makes
 the app write the handoff magic and reset into the bootloader, then flashes.
 

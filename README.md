@@ -56,6 +56,7 @@ unique chip-UID serial as the app — so the host can match a module across both
 | `0x03` READ_STATUS | `03` | reply `[state, err]` |
 | `0x04` VERIFY | `04 crc32(4, LE)` | CRC-check the written app; write metadata **only on match** |
 | `0x05` BOOT | `05` | jump to the application (no reply) |
+| `0xB2` GET_DIAGNOSTIC | `B2` | reply `[branch, rstsckr(4, LE)]` — see [Diagnosing a bootloader entry](#diagnosing-a-bootloader-entry) below |
 
 `state`: 0 IDLE, 1 BUSY, 2 READY, 3 ERROR. `err`: 0 ok, 5 CRC mismatch, 6 region overflow.
 
@@ -116,6 +117,47 @@ See `module-usb-led` for the reference (`app.ld` + the `0xB0` handler).
   drops to flashing mode if it's invalid; re-run `usb_flash.ps1`.
 - Bootloader itself damaged: BOOT0 jumper + WCHISPTool → re-flash
   `noknok_usb_bootloader.bin`.
+
+## Diagnosing a bootloader entry
+
+If a module unexpectedly shows up in the bootloader (PID `4E42`) instead of the
+app — especially after being power-cycled or moved to a different host/rig —
+`0xB2 GET_DIAGNOSTIC` answers **why**, without needing to flash anything first:
+
+```
+powershell -ExecutionPolicy Bypass -File tools/usb_get_diagnostic.ps1
+```
+
+`main()`'s boot decision has two independent paths into flashing mode, which
+look identical from the outside (the module "just is in the bootloader"):
+
+- **Branch A** — the app itself wrote the `0xB0` handoff magic and reset
+  (a legitimate, expected OTA entry).
+- **Branch B** — `app_is_valid()` found bad/missing metadata or a CRC mismatch
+  on the boot-time scan (the brick-safe fallback — could mean a genuinely bad
+  app image, **or** a marginal-power CRC-read glitch on a specific rig even
+  though the flash contents are actually fine).
+
+`0xB2` reports which branch fired on the *last* flashing-mode entry, plus the
+raw `RCC->RSTSCKR` reset-cause register (`PORRSTF`/`PINRSTF`/`SFTRSTF`/
+`IWDGRSTF`/`WWDGRSTF`/`LPWRRSTF`) captured at the very first line of `main()`,
+before anything else can disturb it. Cross-referencing the two tells branch A
+(intentional handoff, expect `SFTRSTF`) apart from branch B triggered by a real
+brownout/POR (expect `PORRSTF`) apart from branch B triggered by something else
+entirely (a genuinely bad/corrupt image, no power-on flag set).
+
+**Caveat:** the diagnostic is stored in no-init RAM (a separate word from the
+handoff cell, at `0x200027F4`, never touched by the flashing protocol) — it
+survives a *warm* reset but is not guaranteed to survive a full power removal.
+If the module has been completely unplugged since the entry you're
+investigating, `branch=0` / a zeroed `RSTSCKR` is itself informative: it means
+SRAM wasn't retained across that power event, which is circumstantial evidence
+for real power marginality on that rig, not a tool failure.
+
+**Requires a bootloader built after this diagnostic was added (2026-07)** —
+older bootloaders (including any already SWD/BOOT0-flashed onto a board before
+this change) do not implement `0xB2` and will not reply; re-flash
+`firmware/bin/noknok_usb_bootloader.bin` via BOOT0 + WCHISPTool to add it.
 
 ## CH32V203 flash gotcha (for maintainers)
 

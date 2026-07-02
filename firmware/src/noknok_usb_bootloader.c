@@ -29,11 +29,30 @@
  *   0x04 VERIFY  crc32(4, LE)    -> flush, CRC the written app, write metadata
  *                                    if it matches; reply [state,err]
  *   0x05 BOOT                    -> jump to the application (no reply)
+ *   0xB2 GET_DIAGNOSTIC          -> reply [branch, rstsckr0..3(LE)] (see below)
  *   state: 0 IDLE 1 BUSY 2 READY 3 ERROR ; err: 0 ok, 5 CRC mismatch, 6 region
  *
  * STATUS LED: PB8 (BOOT0), ACTIVE-HIGH (per noknok decision; pin+polarity are
  *   per-module/per-MCU, "off in the resting state" is the invariant). No LED is
  *   fitted on the current board; PB8 is a plain GPIO after boot (safe).
+ *
+ * BOOT-DECISION DIAGNOSTIC (0xB2, added Jul 2026 - see the DEV-12 "why did the
+ * module land back in the bootloader" investigation): main()'s boot decision has
+ * two independent ways to end up in flashing mode -
+ *   branch A: HANDOFF_CELL held the app's legitimate 0xB0 magic
+ *   branch B: app_is_valid() returned false (bad/missing metadata or CRC)
+ * Both are indistinguishable from the OUTSIDE (module just "is in the
+ * bootloader"), which made a real question - is a module reverting because of a
+ * genuine reset it can't avoid (branch A, stale SRAM read as the magic by pure
+ * chance) or because its own CRC scan is glitching on marginal power on some
+ * rigs (branch B) - impossible to answer without instrumentation. DIAG_CELL (a
+ * SEPARATE word from the handoff cell, so it never interferes with the handoff
+ * protocol) latches which branch fired PLUS the raw RCC->RSTSCKR reset-cause
+ * bits (PORRSTF/PINRSTF/SFTRSTF/IWDGRSTF/WWDGRSTF/LPWRRSTF), captured as the
+ * very first thing main() does (we never clear RMVF, so the register itself is
+ * left exactly as the reset left it). Read any time the module is sitting in
+ * the bootloader via the new 0xB2 command - no flashing required, purely
+ * observational.
  *
  * Reuses the LED module's proven USBD (FSDEV) CDC stack + 48 MHz HSE bring-up.
  */
@@ -59,6 +78,30 @@ struct app_meta { uint32_t magic; uint32_t app_len; uint32_t app_crc32; };
 /* ---- handoff cell: top 16 B of RAM, protected by bootloader.ld + app.ld ---- */
 #define HANDOFF_CELL    (*(volatile uint32_t *)0x200027F0u)
 #define ENTER_BL_MAGIC  0x6E6B4F54u             /* 'nkOT' - app writes this then resets */
+
+/* ---- boot-decision diagnostic: a SEPARATE word in the same reserved 16 B,
+ * @0x200027F4 (HANDOFF_CELL is @0x200027F0, 4 B) - never touched by the
+ * handoff protocol, so it can't corrupt or be corrupted by it. No-init RAM,
+ * so it (like the handoff cell) survives a WARM reset but not a cold power-up
+ * - that is itself diagnostic: an unexpected/garbage value on 0xB2 after a
+ * power cycle is consistent with "SRAM wasn't retained", which is exactly the
+ * kind of fact branch-A-vs-B needs.
+ *
+ * Layout: bits [31:24] and [1:0] are the REAL RCC->RSTSCKR reset-cause bits
+ * (RMVF/PINRSTF/PORRSTF/SFTRSTF/IWDGRSTF/WWDGRSTF/LPWRRSTF live in [31:24];
+ * LSION/LSIRDY live in [1:0]) captured verbatim, unmodified, as the very first
+ * thing main() does (we deliberately do NOT clear RMVF, so we never disturb
+ * the register - see the main() comment). Bits [9:8] are ours - unused by the
+ * real register - and hold which branch fired last (0 = none captured yet/
+ * unreadable, 1 = branch A magic, 2 = branch B invalid app). This packing
+ * means DIAG_CELL is "RSTSCKR with the branch stamped into spare bits", so
+ * nothing is lost and nothing real is overwritten. */
+#define DIAG_CELL            (*(volatile uint32_t *)0x200027F4u)
+#define DIAG_BRANCH_SHIFT    8u
+#define DIAG_BRANCH_MASK     (0x3u << DIAG_BRANCH_SHIFT)
+#define DIAG_BRANCH_MAGIC    (1u << DIAG_BRANCH_SHIFT)
+#define DIAG_BRANCH_INVALID  (2u << DIAG_BRANCH_SHIFT)
+#define CMD_GET_DIAGNOSTIC   0xB2u
 
 /* ---- status LED on PB8 (active-high) ---- */
 #define STATUS_LED_PIN  8
@@ -244,6 +287,27 @@ static void send_status(void) {
     USBD_SendEndpoint(3, r, 2);
 }
 
+/* 0xB2 GET_DIAGNOSTIC reply: 5 bytes, [branch, rstsckr0..3(LE)].
+ * branch: 0 = no flashing-mode entry captured yet this power-up (DIAG_CELL is
+ *   whatever no-init SRAM happened to hold, or the value we might reasonably
+ *   never touch on a normal app boot - see the "only stamp on entry" note in
+ *   main()), 1 = branch A (handoff magic), 2 = branch B (app_is_valid failed).
+ * rstsckr0..3: the RAW RCC->RSTSCKR value captured at the top of main() on
+ *   THAT flashing-mode entry, with our own branch bits masked back OUT (the
+ *   host gets the real hardware register value, unmodified) - decode with
+ *   RCC_PORRSTF/PINRSTF/SFTRSTF/IWDGRSTF/WWDGRSTF/LPWRRSTF (bits 24-31). */
+static void send_diagnostic(void) {
+    uint32_t d = DIAG_CELL;
+    uint8_t branch = (uint8_t)((d & DIAG_BRANCH_MASK) >> DIAG_BRANCH_SHIFT);
+    uint32_t rstsckr = d & ~DIAG_BRANCH_MASK;
+    uint8_t r[5] = {
+        branch,
+        (uint8_t)(rstsckr & 0xFF), (uint8_t)((rstsckr >> 8) & 0xFF),
+        (uint8_t)((rstsckr >> 16) & 0xFF), (uint8_t)((rstsckr >> 24) & 0xFF)
+    };
+    USBD_SendEndpoint(3, r, 5);
+}
+
 static enum { P_CMD, P_WRITE_N, P_WRITE_DATA, P_VERIFY } pstate = P_CMD;
 static uint8_t wr_remaining = 0;
 static uint8_t vbuf[4];
@@ -253,11 +317,12 @@ static void process_byte(uint8_t b) {
     switch (pstate) {
         case P_CMD:
             switch (b) {
-                case CMD_ERASE:       do_erase();   send_status(); break;
-                case CMD_READ_STATUS: send_status();               break;
-                case CMD_WRITE:       pstate = P_WRITE_N;          break;
-                case CMD_VERIFY:      vidx = 0; pstate = P_VERIFY;  break;
-                case CMD_BOOT:        jump_to_app();               break;  /* no return */
+                case CMD_ERASE:          do_erase();   send_status(); break;
+                case CMD_READ_STATUS:    send_status();               break;
+                case CMD_WRITE:          pstate = P_WRITE_N;          break;
+                case CMD_VERIFY:         vidx = 0; pstate = P_VERIFY;  break;
+                case CMD_BOOT:           jump_to_app();               break;  /* no return */
+                case CMD_GET_DIAGNOSTIC: send_diagnostic();           break;
                 default: break;
             }
             break;
@@ -298,10 +363,30 @@ int USBFS_SendEndpointNEW(int endp, uint8_t *data, int len, int copy) {
  * Main
  * ============================================================ */
 int main(void) {
+    /* Capture the reset cause FIRST, before anything (RMVF clear, RCC changes,
+     * even the boot-decision reads themselves) can disturb RCC->RSTSCKR. Do
+     * NOT clear RMVF here - leave the register exactly as the reset left it,
+     * in case something else ever wants to read it too; DIAG_CELL is our own
+     * durable copy. See the DIAG_CELL comment above for the bit layout. */
+    uint32_t rstsckr_raw = RCC->RSTSCKR;
+
     /* Boot decision at the reset-default HSI clock (no USB needed yet). */
     int enter_flash = 0;
-    if (HANDOFF_CELL == ENTER_BL_MAGIC) { HANDOFF_CELL = 0; enter_flash = 1; }
-    else if (!app_is_valid())           { enter_flash = 1; }
+    uint32_t branch = 0;
+    if (HANDOFF_CELL == ENTER_BL_MAGIC) {
+        HANDOFF_CELL = 0; enter_flash = 1; branch = DIAG_BRANCH_MAGIC;
+    } else if (!app_is_valid()) {
+        enter_flash = 1; branch = DIAG_BRANCH_INVALID;
+    }
+
+    if (enter_flash) {
+        /* Only stamp the diagnostic when we're actually entering flashing
+         * mode - a normal app boot leaves DIAG_CELL untouched from whatever
+         * the LAST flashing-mode entry recorded, which is fine: it's only
+         * ever read via 0xB2, which only works while sitting in the
+         * bootloader in the first place. */
+        DIAG_CELL = (rstsckr_raw & ~DIAG_BRANCH_MASK) | branch;
+    }
 
     if (!enter_flash) jump_to_app();
 

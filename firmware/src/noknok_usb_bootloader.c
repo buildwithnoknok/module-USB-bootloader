@@ -370,6 +370,24 @@ int main(void) {
      * durable copy. See the DIAG_CELL comment above for the bit layout. */
     uint32_t rstsckr_raw = RCC->RSTSCKR;
 
+    /* POWER-SETTLE DELAY (added Jul 2026, DEV-12 root cause = brownout/POR on a
+     * marginal 5V ramp -> app_is_valid()'s flash CRC scan glitches -> the
+     * bootloader wrongly drops to flashing mode). Confirmed on hardware via the
+     * 0xB2 diagnostic: branch B + PORRSTF. The CRC scan is the voltage-sensitive
+     * step (a ~6 KB flash read) and it runs on EVERY boot, so a brief settle
+     * here lets the rail finish charging through the module's input polyfuse +
+     * 1N4007 + bulk caps before we touch flash, making the scan run on a settled
+     * supply. Sized ~50 ms, NOT seconds: this gates every power-on (incl. the
+     * normal healthy app launch of a shipped lamp), so it must stay imperceptible
+     * - and a hub's 5V ramp + cap charge settles in single-digit-to-tens of ms,
+     * far under 50 ms. A raw cycle busy-loop is used deliberately: it needs no
+     * peripheral/clock/SysTick set up (we are at the reset-default ~8 MHz HSI
+     * here), so it is valid however the chip came out of reset. ~5 cycles/iter
+     * -> ~100k iters ~= 50-60 ms. This is CHEAP INSURANCE, NOT the primary fix -
+     * the real fix is a clean 5V supply / more input bulk cap (see the
+     * module-usb-led hardware notes). Bounded, no side effects. */
+    for (volatile uint32_t s = 0; s < 100000u; s++) { __asm volatile("" ::: "memory"); }
+
     /* Boot decision at the reset-default HSI clock (no USB needed yet). */
     int enter_flash = 0;
     uint32_t branch = 0;

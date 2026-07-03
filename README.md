@@ -67,6 +67,25 @@ unique chip-UID serial as the app — so the host can match a module across both
 2. **BOOT0 jumper + WCH factory ROM bootloader** = the unbrickable backstop to
    re-flash *this* bootloader via WCHISPTool.
 
+## Power-settle delay (brownout mitigation)
+
+`main()` waits ~50 ms (a raw HSI busy-loop, before any flash access) so the 5V
+rail can finish charging through the module's input polyfuse + 1N4007 + bulk
+caps before the boot-time `app_is_valid()` CRC scan runs. **Why:** the DEV-12
+investigation confirmed (via the `0xB2` diagnostic below: *branch B + PORRSTF*)
+that on a marginal 5V ramp — a weak/slow-ramping hub supply, compounded by the
+uninitialised WS2812b inrush that loads the rail before any firmware runs — the
+CH32V203 browns out *during* that CRC scan, corrupting the read even though the
+flash contents are fine, so the bootloader wrongly falls to flashing mode. The
+settle delay removes the sagging-rail condition rather than trying to make the
+scan tolerate it. It is **cheap insurance, not the primary fix** — the real fix
+is a clean supply / more input bulk capacitance / defining the WS2812b power-up
+state (see `module-usb-led` hardware notes). Sized to stay imperceptible: it
+gates every power-on, including a healthy app launch, so it is ~50 ms not
+seconds. **Not attempted:** reordering `clock_to_hse_48()` before the CRC scan —
+running the PLL at 48 MHz on a still-sagging rail is *more* voltage-sensitive
+than the low-power HSI scan, so it could worsen the brownout.
+
 ## Status LED
 
 PB8 (BOOT0), **active-high** (per the noknok decision: status-LED pin + polarity

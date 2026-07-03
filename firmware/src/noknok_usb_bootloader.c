@@ -71,7 +71,6 @@
 #define APP_REGION_LEN   (META_FLASH_ADDR - APP_FLASH_BASE)   /* 0x5F00 = 24320 B */
 #define APP_JUMP_ADDR    0x00002000u            /* alias; app is linked here */
 #define META_MAGIC       0x6E6B5542u            /* 'nkUB' - written only after a verified flash */
-#define FLASH_ERASE_PAGE 1024u                   /* CH32V20x standard page erase = 1 KB */
 
 struct app_meta { uint32_t magic; uint32_t app_len; uint32_t app_crc32; };
 
@@ -119,11 +118,16 @@ enum { ERR_NONE = 0, ERR_CRC = 5, ERR_REGION = 6 };
 static uint8_t bl_state = BL_IDLE;
 static uint8_t bl_error = ERR_NONE;
 
-/* ---- flashing working set ---- */
-static uint32_t write_addr;     /* next real flash addr to program */
-static uint32_t total_written;  /* total app bytes received */
-static uint8_t  hw_lo;          /* pending low byte of the current 16-bit halfword */
-static int      hw_have;        /* 1 if hw_lo holds a byte awaiting its pair */
+/* ---- flashing working set ----
+ * The app streams in over USB in <=32-byte chunks, but the V20x fast programmer
+ * burns a whole 256-byte page at once. So bytes accumulate into page_buf and a
+ * full page is flushed to flash when it fills (the final partial page is
+ * 0xFF-padded and flushed at VERIFY). page_buf is u32-aligned for the word-wise
+ * page program. */
+static uint32_t write_addr;                  /* flash addr of the page currently filling */
+static uint32_t total_written;               /* total app bytes received */
+static uint32_t page_fill;                   /* bytes currently in page_buf (0..256) */
+static uint8_t  page_buf[256] __attribute__((aligned(4)));
 
 /* ============================================================
  * Unique USB serial from the chip UID (same as the app, so a module keeps the
@@ -189,32 +193,105 @@ static inline void led_set(int on) {
 }
 
 /* ============================================================
- * Flash programming (CH32V20x fast pages; per ch32fun examples/flashtest)
+ * Flash programming (CH32V20x FAST 256-byte page program/erase).
+ *
+ * WHY THE 256-BYTE PAGE PATH (not the legacy halfword FLASH_CTLR_PG):
+ *   DEV-12 (Jul 2026): OTA-flashed apps VERIFY correct at write time (do_verify's
+ *   crc32 passes) and the app runs immediately after BOOT - but on the NEXT power
+ *   cycle the boot-time app_is_valid() CRC scan FAILS and the module drops to the
+ *   bootloader. Reproduced entirely on clean PC 5V (no supply/brownout involved).
+ *   Decisive test: byte-identical app content flashed by WCHISPTool survives power
+ *   cycles; the SAME bytes flashed by this bootloader's OLD halfword path did not.
+ *   => a flash RETENTION defect: the old single-halfword program (FLASH_CTLR_PG +
+ *   16-bit write + BSY-wait only, no EOP/error check) UNDER-COMMITTED the cells -
+ *   they read back correct while fresh but lose state across a power-off.
+ *   FIX: the WCH-CHARACTERISED V20x path - and what the vendor flash library
+ *   (ch32fun extralibs/ch20x_30x_flash.h) and WCHISPTool use - is the 256-byte
+ *   FAST PAGE program: MODEKEYR-unlock the fast mode, load a full 256 B page into
+ *   the program buffer (WRBSY poll per word), then PG_STRT to burn it in one
+ *   managed, fully-committed pulse, then check EOP/WRPRTERR. This rewrite matches
+ *   that reference faithfully AND adds a per-page read-back verify + retry
+ *   (flash_program_page) so a page that programs wrong is caught, not advanced
+ *   over. Goal: OTA-programmed cells with WCHISPTool-equivalent retention.
+ *
  * The bootloader only ever touches the app + metadata regions, never its own.
+ * All addresses here are 256-byte aligned (APP_FLASH_BASE=0x2000, META=0x7F00).
  * ============================================================ */
+#define FLASH_PAGE_LEN 256u
+#define WRBSY          0x02u    /* FLASH->STATR word-buffer busy (per WCH SDK/ch32fun) */
+
+static int flash_ok = 1;        /* cleared on any WRPRTERR; do_verify surfaces it */
+
 static void flash_wait(void) {           /* bounded BSY wait -> a stall becomes a recoverable error */
     volatile uint32_t t = 2000000;
     while ((FLASH->STATR & FLASH_STATR_BSY) && t) t--;
 }
+
+/* Busy-poll to completion, capture + clear the status flags (mirrors the WCH
+ * reference _ch20x_30x_flash_busy_poll). Sets flash_ok=0 on a protection error. */
+static void flash_finish(void) {
+    flash_wait();
+    if (FLASH->STATR & FLASH_STATR_WRPRTERR) flash_ok = 0;
+    FLASH->STATR = FLASH_STATR_EOP | FLASH_STATR_WRPRTERR;   /* clear (write-1-to-clear) */
+}
+
 static void flash_unlock(void) {
     RCC->AHBPCENR |= RCC_AHBPeriph_SRAM | RCC_FLITFEN;   /* restore FLITF (USBDSetup cleared it) */
-    FLASH->KEYR = FLASH_KEY1; FLASH->KEYR = FLASH_KEY2;  /* unlock flash for erase/program */
+    FLASH->KEYR    = FLASH_KEY1; FLASH->KEYR    = FLASH_KEY2;  /* unlock erase/program */
+    FLASH->MODEKEYR = FLASH_KEY1; FLASH->MODEKEYR = FLASH_KEY2; /* unlock FAST (page) mode */
 }
-/* Standard CH32V20x flash (per WCH SDK): 1 KB page erase + 16-bit halfword program.
- * The V20x fast-program buffer bits differ from the V003 family (0x40000/0x80000
- * are block-erase on V20x), so we use the simple, robust standard sequence. */
-static void flash_erase_1k(uint32_t addr) {
-    FLASH->CTLR |= FLASH_CTLR_PER;
-    FLASH->ADDR  = addr;
-    FLASH->CTLR |= CR_STRT_Set;
-    flash_wait();
-    FLASH->CTLR &= ~FLASH_CTLR_PER;
+
+/* Fast 256-byte page erase (CR_PAGE_ER + PG_STRT), per the WCH reference. */
+static void flash_erase_page(uint32_t addr) {
+    FLASH->CTLR = CR_PAGE_ER;
+    FLASH->ADDR = addr;
+    FLASH->CTLR = CR_STRT_Set | CR_PAGE_ER;
+    flash_finish();
+    FLASH->CTLR = 0;
 }
-static void flash_program_hword(uint32_t addr, uint16_t val) {
-    FLASH->CTLR |= FLASH_CTLR_PG;
-    *(volatile uint16_t *)addr = val;
-    flash_wait();
-    FLASH->CTLR &= ~FLASH_CTLR_PG;
+
+/* One fast 256-byte page-program pulse: load the whole page into the buffer as
+ * 32-bit words (WRBSY poll between words), then PG_STRT to burn it. `data` = 64
+ * u32 words. Faithful to the WCH reference _ch20x_30x_flash_page_write. */
+static void flash_program_page_once(uint32_t addr, const uint32_t *data) {
+    volatile uint32_t *dst = (volatile uint32_t *)addr;
+    FLASH->CTLR = CR_PAGE_PG;                       /* enter fast page-program */
+    for (uint32_t i = 0; i < FLASH_PAGE_LEN / 4; i++) {
+        dst[i] = data[i];
+        while (FLASH->STATR & WRBSY);               /* wait word into buffer */
+    }
+    FLASH->CTLR = CR_PAGE_PG | CR_PG_STRT;          /* buffer -> flash */
+    flash_finish();
+    FLASH->CTLR = 0;                                /* clear FTPG */
+}
+
+/* Program a page WITH read-back verify + retry. This is the belt-and-suspenders
+ * for the DEV-12 flash-RETENTION bug: the failure mode was cells that read back
+ * correct right after programming but did NOT retain across a power cycle
+ * (under-committed). A single post-program read-back verify here doesn't by
+ * itself prove retention (the cell is still fresh), BUT the fast-page program
+ * pulse above is the WCH-characterised full-commit method, and a per-page
+ * verify+retry catches any page the controller reports/leaves wrong so we never
+ * advance over a bad page. On a persistent mismatch we set flash_ok=0 -> the
+ * whole flash is rejected (ERR_REGION), so a defective program can never be
+ * marked valid. `data` must point at a 256-byte, 4-aligned source buffer. */
+#define FLASH_PROG_RETRIES 3
+static void flash_program_page(uint32_t addr, const uint32_t *data) {
+    const uint32_t *src = data;
+    for (int attempt = 0; attempt <= FLASH_PROG_RETRIES; attempt++) {
+        flash_program_page_once(addr, src);
+        /* read-back verify the whole page */
+        const volatile uint32_t *v = (const volatile uint32_t *)addr;
+        int ok = 1;
+        for (uint32_t i = 0; i < FLASH_PAGE_LEN / 4; i++) {
+            if (v[i] != src[i]) { ok = 0; break; }
+        }
+        if (ok) return;                              /* programmed + reads back correct */
+        if (attempt < FLASH_PROG_RETRIES) {
+            flash_erase_page(addr);                  /* clear + retry the pulse */
+        }
+    }
+    flash_ok = 0;                                    /* gave up -> reject the flash */
 }
 
 /* ============================================================
@@ -222,43 +299,56 @@ static void flash_program_hword(uint32_t addr, uint16_t val) {
  * ============================================================ */
 static void do_erase(void) {
     bl_state = BL_BUSY; bl_error = ERR_NONE;
+    flash_ok = 1;
     flash_unlock();
-    /* erase the whole app + metadata region (0x2000 .. 0x8000) in 1 KB pages */
-    for (uint32_t a = APP_FLASH_BASE; a < 0x08008000u; a += FLASH_ERASE_PAGE)
-        flash_erase_1k(a);
-    write_addr = APP_FLASH_BASE;
+    /* erase the whole app + metadata region (0x2000 .. 0x8000) in 256-byte pages */
+    for (uint32_t a = APP_FLASH_BASE; a < 0x08008000u; a += FLASH_PAGE_LEN)
+        flash_erase_page(a);
+    write_addr    = APP_FLASH_BASE;
     total_written = 0;
-    hw_have = 0;
+    page_fill     = 0;
+    if (!flash_ok) { bl_state = BL_ERROR; bl_error = ERR_REGION; return; }
     bl_state = BL_IDLE;
+}
+
+/* Program the current 256-byte page buffer to flash and advance. Any unused tail
+ * of the buffer must already be 0xFF-filled by the caller (matches an erased
+ * cell, so it programs to no-change). */
+static void flush_page(void) {
+    flash_program_page(write_addr, (const uint32_t *)page_buf);
+    write_addr += FLASH_PAGE_LEN;
+    page_fill = 0;
 }
 
 static void write_byte(uint8_t b) {
     if (total_written >= APP_REGION_LEN) { bl_state = BL_ERROR; bl_error = ERR_REGION; return; }
-    if (!hw_have) { hw_lo = b; hw_have = 1; }
-    else {
-        flash_program_hword(write_addr, (uint16_t)hw_lo | ((uint16_t)b << 8));
-        write_addr += 2;
-        hw_have = 0;
-    }
+    page_buf[page_fill++] = b;
     total_written++;
+    if (page_fill == FLASH_PAGE_LEN) flush_page();     /* full page -> burn it */
 }
 
 static void do_verify(uint32_t expected_crc) {
-    /* flush a dangling odd byte (pad the high byte with 0xFF) */
-    if (hw_have) {
-        flash_program_hword(write_addr, (uint16_t)hw_lo | 0xFF00u);
-        write_addr += 2;
-        hw_have = 0;
+    /* flush the final partial page (0xFF-pad the unused tail so it programs to
+     * erased/no-change) */
+    if (page_fill) {
+        for (uint32_t i = page_fill; i < FLASH_PAGE_LEN; i++) page_buf[i] = 0xFF;
+        flush_page();
     }
+    if (!flash_ok) { bl_state = BL_ERROR; bl_error = ERR_REGION; return; }
+
     uint32_t crc = crc32_calc((const uint8_t *)APP_FLASH_BASE, total_written);
     if (crc != expected_crc) { bl_state = BL_ERROR; bl_error = ERR_CRC; return; }
 
-    /* write metadata (validity marker) - meta page already erased by do_erase.
-     * Only now is the app considered good. */
+    /* write metadata (validity marker) into its own 256-byte page. META_FLASH_ADDR
+     * (0x7F00) is page-aligned + already erased by do_erase; program a full page
+     * with the struct at the front and 0xFF elsewhere. Only now is the app good. */
+    static uint8_t meta_page[256] __attribute__((aligned(4)));
+    for (uint32_t i = 0; i < FLASH_PAGE_LEN; i++) meta_page[i] = 0xFF;
     struct app_meta m = { META_MAGIC, total_written, crc };
-    const uint16_t *mp = (const uint16_t *)&m;
-    for (uint32_t i = 0; i < sizeof(m) / 2; i++)
-        flash_program_hword(META_FLASH_ADDR + i * 2, mp[i]);
+    __builtin_memcpy(meta_page, &m, sizeof(m));
+    flash_program_page(META_FLASH_ADDR, (const uint32_t *)meta_page);
+    if (!flash_ok) { bl_state = BL_ERROR; bl_error = ERR_REGION; return; }
+
     bl_state = BL_READY; bl_error = ERR_NONE;
 }
 
@@ -370,22 +460,18 @@ int main(void) {
      * durable copy. See the DIAG_CELL comment above for the bit layout. */
     uint32_t rstsckr_raw = RCC->RSTSCKR;
 
-    /* POWER-SETTLE DELAY (added Jul 2026, DEV-12 root cause = brownout/POR on a
-     * marginal 5V ramp -> app_is_valid()'s flash CRC scan glitches -> the
-     * bootloader wrongly drops to flashing mode). Confirmed on hardware via the
-     * 0xB2 diagnostic: branch B + PORRSTF. The CRC scan is the voltage-sensitive
-     * step (a ~6 KB flash read) and it runs on EVERY boot, so a brief settle
-     * here lets the rail finish charging through the module's input polyfuse +
-     * 1N4007 + bulk caps before we touch flash, making the scan run on a settled
-     * supply. Sized ~50 ms, NOT seconds: this gates every power-on (incl. the
-     * normal healthy app launch of a shipped lamp), so it must stay imperceptible
-     * - and a hub's 5V ramp + cap charge settles in single-digit-to-tens of ms,
-     * far under 50 ms. A raw cycle busy-loop is used deliberately: it needs no
-     * peripheral/clock/SysTick set up (we are at the reset-default ~8 MHz HSI
-     * here), so it is valid however the chip came out of reset. ~5 cycles/iter
-     * -> ~100k iters ~= 50-60 ms. This is CHEAP INSURANCE, NOT the primary fix -
-     * the real fix is a clean 5V supply / more input bulk cap (see the
-     * module-usb-led hardware notes). Bounded, no side effects. */
+    /* POWER-SETTLE DELAY (~50 ms) before the boot-time CRC scan. NOTE on the
+     * rationale (DEV-12, corrected Jul 2026): the ACTUAL root cause of the DEV-12
+     * failure was NOT a brownout - it was read-marginal flash left by the OLD
+     * halfword programmer (now fixed by the fast-page program path below), which
+     * failed the CRC scan on a marginal supply that a WCHISPTool-programmed image
+     * survived. So this delay is NOT the primary fix. It is kept only as cheap,
+     * harmless defence-in-depth: it lets the rail finish charging through the
+     * module's input polyfuse + 1N4007 + bulk caps before the ~6 KB flash CRC
+     * read, which can only help any residual marginal-supply-at-boot effect and
+     * costs ~50 ms on a cold boot (imperceptible; it gates every power-on incl. a
+     * healthy app launch, hence ~50 ms not seconds). Raw HSI busy-loop: needs no
+     * peripheral/clock/SysTick, valid however the chip reset. ~100k iters. */
     for (volatile uint32_t s = 0; s < 100000u; s++) { __asm volatile("" ::: "memory"); }
 
     /* Boot decision at the reset-default HSI clock (no USB needed yet). */

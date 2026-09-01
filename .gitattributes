@@ -1,0 +1,31 @@
+﻿# Binary assets - never apply line-ending conversion.
+# Without this, core.autocrlf=true corrupts PDFs (and any binary git
+# misdetects as text) on checkout. Verified: a 388495-byte schematic PDF
+# came out of a fresh clone at 414032 bytes.
+*.pdf   binary
+*.zip   binary
+*.epro  binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.webp  binary
+*.mp4   binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.otf   binary
+*.step  binary
+*.stp   binary
+*.stl   binary
+*.3mf   binary
+*.f3d   binary
+*.bin   binary
+*.hex   binary
+*.elf   binary
+*.uf2   binary
+*.mpy   binary
+*.docx  binary
+*.xlsx  binary
+*.pptx  binary

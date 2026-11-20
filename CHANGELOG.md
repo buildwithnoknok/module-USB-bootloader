@@ -12,6 +12,25 @@ here. This versioning is **independent of the module application firmware** (e.g
 
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.0.0] — 2026-11-20 — NOT RELEASED (branch `dev-237-v203-stage0-stage1`)
+
+### Changed (breaking: new flash layout 4, one full-image re-flash per module)
+- **DEV-237 — the bootloader is now field-updatable.** Split like the I2C bootloader:
+  a new frozen **stage-0** (`firmware/stage0/`, 740 B of 1 KB, no USB) at `0x0000`, and
+  this CDC bootloader relinked as **stage-1** at `0x0400` (7 KB region, 5576 B). The app
+  base stays `0x2000`, so the LED apps run unchanged; the app region shrinks by the new
+  control-block page `0x7E00` (23.5 KB, apps today are 6-9 KB).
+- New `0x06 VERIFY_STAGE1 crc32` (stage-1 self-update, header + chip guard: error 8 for an
+  image that is not a V203 layout-4 stage-1), `0xB1 GET_VERSION` -> 5 bytes with layout 4.
+- BOOT no longer jumps into an invalid app (stays, error 6); a pending stage-1 update makes
+  BOOT reset so stage-0 installs it.
+- Tools: `usb_flash.py --stage1`, new `mk_full_v203.py` (layout-4 full image + `--check`).
+
+The above "not updated over the air" note is true up to 1.1.0 only. Sizes are from the
+agent-hq toolchain (gcc 14.2, ch32fun 95030fd), which does not reproduce the released 1.1.0
+byte for byte (5156 vs 5148 B); the release build comes from the bench toolchain.
+Not tested on hardware yet.
+
 ## [1.1.0] — 2026-07-04
 
 ### Fixed

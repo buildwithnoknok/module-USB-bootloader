@@ -23,7 +23,35 @@ firmware** so OTA could ride it for free — it is **not reachable**:
 So we own the bootloader. Entry uses the **magic-in-RAM + warm reset** pattern
 (same as the I2C modules), which is proven to work on this chip.
 
-## Flash map (32 KB; flash at `0x08000000`, also aliased at `0x00000000`)
+## Layout 4: frozen stage-0 + updatable stage-1 (2.0.0, DEV-237, not released yet)
+
+> **Status:** source on branch `dev-237-v203-stage0-stage1`, built and host-checked,
+> **not bench-tested, not released.** `firmware/bin/` still holds the single-stage 1.1.0.
+
+Since 2.0.0 the bootloader is split like the I2C one, so a bootloader bug can be fixed
+over USB instead of re-flashing every module with the jumper:
+
+| Region | Address | Notes |
+|--------|---------|-------|
+| Stage-0 | `0x08000000` (1 KB) | `firmware/stage0/` - **frozen**: applies a pending stage-1 update (3 gates: descriptor CRC, geometry, staged-image CRC; verified page by page; power-cut safe), then jumps to stage-1. No USB. |
+| Stage-1 | `0x08000400` (7 KB) | `firmware/src/` - the CDC bootloader below; header `NKS1`/base `0x400`/layout 4/target `V203` at +`0x100` |
+| Application | `0x08002000` (23.5 KB) | unchanged base: the LED apps run as they are; also the staging area for a stage-1 update |
+| Control block | `0x08007E00` (256 B) | stage-1 update marker for stage-0 (same field order as the I2C one) |
+| Metadata | `0x08007F00` (256 B) | `{magic, app_len, app_crc32}` |
+
+Stage-1 self-update: `ERASE → WRITE… → 0x06 VERIFY_STAGE1 crc32(4, LE) → BOOT`. VERIFY_STAGE1
+refuses an image that is not a V203 layout-4 stage-1 (error 8). BOOT resets, stage-0 installs,
+the module comes back **in the bootloader** (the app region held the staged image): push the
+app again. Host tool: `python3 tools/usb_flash.py stage1.bin --stage1`.
+New stage-1 commands: `0xB1` GET_VERSION → `[proto, major, minor, patch, layout=4]`, `0x06`
+VERIFY_STAGE1. BOOT with no valid app now stays in the bootloader with error 6 (1.x jumped).
+
+**Getting stage-0 onto a module (once):** a blank board, or one still on bootloader 1.x, is
+flashed with ONE full image via the BOOT0 jumper + WCHISPTool (or SWD):
+`python tools/mk_full_v203.py stage0.bin stage1.bin app.bin full.bin` (`--check` re-validates).
+A 1.x bootloader cannot install stage-0 itself (it never writes below `0x2000`).
+
+## Flash map up to 1.1.0 (single stage; 32 KB, flash at `0x08000000`, also aliased at `0x00000000`)
 
 | Region | Address | Notes |
 |--------|---------|-------|

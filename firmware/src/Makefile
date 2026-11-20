@@ -1,4 +1,7 @@
-all: flash
+# STAGE-1 of the layout-4 USB bootloader (DEV-237), linked at 0x0400.
+# `make` builds only; flashing a stage-1 alone over SWD is not a supported path
+# (use the full image: tools/mk_full_v203.py, or a stage-1 self-update over USB).
+all: build
 
 TARGET     := noknok_usb_bootloader
 TARGET_MCU := CH32V203

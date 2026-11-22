@@ -127,12 +127,16 @@ static void fl_erase(uint32_t addr)
     FLASH->CTLR = 0;
 }
 
+/* src NULL = program 0xFF words. On the CH32V203 a fast page erase leaves the
+ * cells reading 0xE339E339, NOT 0xFF (bench, 22 Nov 2026: the first stage-0 build
+ * failed its own blank-page verify on exactly that). So a page that must end up
+ * blank is erased AND programmed with 0xFF, which reads back as 0xFF. */
 static void fl_program(uint32_t addr, const uint32_t *src)
 {
     volatile uint32_t *dst = (volatile uint32_t *)addr;
     FLASH->CTLR = CR_PAGE_PG;
     for (uint32_t i = 0; i < PAGE_WORDS; i++) {
-        dst[i] = src[i];
+        dst[i] = src ? src[i] : 0xFFFFFFFFU;
         for (uint32_t t = BSY_TIMEOUT; t && (FLASH->STATR & WRBSY); t--);
     }
     FLASH->CTLR = CR_PAGE_PG | CR_PG_STRT;
@@ -151,12 +155,12 @@ static int page_matches(uint32_t addr, const uint32_t *src)
     return 1;
 }
 
-/* Erase, optionally program, then VERIFY. Retries. Returns 0 if it never took. */
+/* Erase, program (src NULL = 0xFF), then VERIFY. Retries. Returns 0 if it never took. */
 static int write_page(uint32_t addr, const uint32_t *src)
 {
     for (uint32_t t = 0; t < RETRIES; t++) {
         fl_erase(addr);
-        if (src) fl_program(addr, src);
+        fl_program(addr, src);
         if (page_matches(addr, src)) return 1;
     }
     return 0;
@@ -236,12 +240,8 @@ int main(void)
                 if (!write_page(STAGE1_BASE_FLASH + off, src)) fail_attempt();
             }
 
-            /* Clear the marker LAST. */
-            for (uint32_t t = 0; t < RETRIES; t++) {
-                fl_erase(CTRL_FLASH);
-                if (page_matches(CTRL_FLASH, 0)) break;
-            }
-            if (!page_matches(CTRL_FLASH, 0)) fail_attempt();
+            /* Clear the marker LAST (erase + 0xFF program + verify, see fl_program). */
+            if (!write_page(CTRL_FLASH, 0)) fail_attempt();
 
             ATTEMPT_CELL = 0;
             NVIC_SystemReset();
@@ -250,8 +250,11 @@ int main(void)
          * unlock flash on a normal boot). */
     }
 
-    /* Normal boot: if a stage-1 was ever programmed, run it. */
-    if (*(const volatile uint32_t *)STAGE1_BASE_FLASH != 0xFFFFFFFFU)
+    /* Normal boot: if a stage-1 was ever programmed, run it. Both blank values
+     * count as "nothing there": 0xFF (factory / programmed blank) and 0xE339E339
+     * (fast-erased, never programmed). */
+    uint32_t first = *(const volatile uint32_t *)STAGE1_BASE_FLASH;
+    if (first != 0xFFFFFFFFU && first != 0xE339E339U)
         asm volatile("jr %0" :: "r"(STAGE1_BASE_EXEC));
 
     halt();

@@ -29,7 +29,15 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 The above "not updated over the air" note is true up to 1.1.0 only. Sizes are from the
 agent-hq toolchain (gcc 14.2, ch32fun 95030fd), which does not reproduce the released 1.1.0
 byte for byte (5156 vs 5148 B); the release build comes from the bench toolchain.
-Not tested on hardware yet.
+Bench 22 Nov 2026 (cellar rig, LEDs 16x on the WCH-LinkE, bench toolchain; main 1.1.0 rebuilds byte-identical;
+release sizes stage-0 712 B, stage-1 2.0.0 5568 B): stage-0 SWD tests `firmware/stage0/test/run_s0_tests.sh` 6/6 PASS
+(armed update installed, a copy cut half-way redone, bad descriptor / bad image CRC / bad geometry refused with the
+stage-1 untouched, control block cleared after the install). **Found and fixed by that test:** on the CH32V203 a
+fast page erase leaves the cells reading 0xE339E339, not 0xFF, so the first stage-0 failed its own blank-page verify
+and halted; stage-0 now programs blank pages with 0xFF after the erase and treats 0xE339E339 as blank in its boot
+check. Boot chain proven via the stage-1 diagnostic cell: layout-4 image with app -> app path; installed stage-1
+without app -> flash mode. NOT yet tested: the USB side (0xB1, VERIFY_STAGE1 over CDC, app OTA through stage-1 2.0.0,
+power cuts during a USB transfer) - the module's USB-C was not reachable from the Pi or the brain that day.
 
 ## [1.1.0] — 2026-07-04
 

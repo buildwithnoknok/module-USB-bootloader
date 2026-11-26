@@ -1,4 +1,31 @@
 /*
+ * noknok USB Module Bootloader - STAGE-1 v2.0.0 - CH32V203, flash layout 4
+ * =========================================================================
+ * DEV-237 (Nov 2026): the bootloader is split like the I2C one. A frozen 1 KB
+ * stage-0 (firmware/stage0/) sits at 0x0000; THIS file is stage-1, relinked to
+ * 0x0400, and can now replace itself over USB:
+ *
+ *   app update:      ERASE -> WRITE xN -> VERIFY(0x04)        -> BOOT
+ *   stage-1 update:  ERASE -> WRITE xN -> VERIFY_STAGE1(0x06) -> BOOT
+ *
+ * VERIFY_STAGE1 CRCs the image staged in the app region, checks its header
+ * (NKS1, base 0x400, layout 4, target "V203" - an I2C stage-1 or an app is
+ * refused, error 8) and only then writes the control block at 0x7E00. BOOT then
+ * resets and stage-0 copies the image into 0x0400 (verified, power-cut safe).
+ * The app is destroyed by that (staging = app region) and re-pushed afterwards.
+ * New in 2.0.0 as well: 0xB1 GET_VERSION -> [proto, major, minor, patch, layout]
+ * like the I2C stage-1, and BOOT refuses an invalid app (stays, error 6).
+ *
+ * 2.0.0 FLASH MAP (32 KB; also aliased at 0x00000000):
+ *   stage-0      0x08000000 .. 0x080003FF   (1 KB, FROZEN, BOOT0/SWD only)
+ *   stage-1      0x08000400 .. 0x08001FFF   (7 KB, this image, updatable)
+ *   application  0x08002000 .. 0x08007DFF   (23.5 KB, also the staging area)
+ *   control blk  0x08007E00 .. 0x08007EFF   (stage-1 update marker for stage-0)
+ *   metadata     0x08007F00 .. 0x08007FFF   ({magic, app_len, app_crc32})
+ * Existing modules (bootloader 1.x at 0x0000) need ONE full-image re-flash
+ * (BOOT0 jumper + WCHISPTool, or SWD) to get stage-0; after that, OTA.
+ *
+ * ---- history: v1.x text below (single-stage, 8 KB at 0x0000) ----
  * noknok USB Module Bootloader - CH32V203 (v1.0)
  * ================================================
  * USB-CDC OTA bootloader for the noknok USB modules. The USB counterpart of
@@ -61,14 +88,45 @@
 #include "usbd.h"
 #include <string.h>
 
-#define BL_VERSION_MAJOR  1
-#define BL_VERSION_MINOR  1
+/* -D overrides are for test images (e.g. a 2.0.1 to prove a self-update). */
+#define BL_PROTOCOL_VERSION 0x01
+#ifndef BL_VERSION_MAJOR
+#define BL_VERSION_MAJOR  2     /* 2.0.0: stage-1 of layout 4 (DEV-237). 1.1.0: DEV-12 retention fix */
+#endif
+#ifndef BL_VERSION_MINOR
+#define BL_VERSION_MINOR  0
+#endif
+#ifndef BL_VERSION_PATCH
 #define BL_VERSION_PATCH  0
+#endif
+#define BL_LAYOUT         4u    /* V203 layout ids are unique across chip families (I2C: 2 V003, 3 X035) */
 
 /* ---- flash map (REAL addresses for erase/program/CRC) ---- */
+#define STAGE1_FLASH_BASE 0x08000400u
 #define APP_FLASH_BASE   0x08002000u
+#define CTRL_FLASH_ADDR  0x08007E00u            /* stage-1 update control block (layout 4) */
 #define META_FLASH_ADDR  0x08007F00u
-#define APP_REGION_LEN   (META_FLASH_ADDR - APP_FLASH_BASE)   /* 0x5F00 = 24320 B */
+#define APP_REGION_LEN   (CTRL_FLASH_ADDR - APP_FLASH_BASE)   /* 0x5E00 = 24064 B */
+#define STAGE1_REGION_LEN (APP_FLASH_BASE - STAGE1_FLASH_BASE) /* 0x1C00 = 7 KB */
+
+/* ---- stage-1 image header: 20 B at base + 0x100 (bootloader.ld places it) ----
+ * Same idea and field order as the I2C stage-1 (DEV-31 hardening E, DEV-124
+ * target word): VERIFY_STAGE1 refuses a staged image unless it finds this. */
+#define HDR_OFFSET       0x100u
+#define HDR_MAGIC        0x31534B4Eu            /* "NKS1" */
+#define HDR_TARGET       0x33303256u            /* "V203" */
+typedef struct { uint32_t magic, base, layout, version, target; } stage1_hdr_t;
+__attribute__((section(".stage1_hdr"), used))
+const stage1_hdr_t stage1_hdr = {
+    HDR_MAGIC, 0x00000400u, BL_LAYOUT,
+    ((uint32_t)BL_PROTOCOL_VERSION << 24) | ((uint32_t)BL_VERSION_MAJOR << 16) |
+    ((uint32_t)BL_VERSION_MINOR << 8) | (uint32_t)BL_VERSION_PATCH,
+    HDR_TARGET,
+};
+
+/* ---- control block (read by the frozen stage-0; field order is a contract) ---- */
+#define CTRL_MAGIC       0x6E6B5530u            /* "nkU0" - update pending */
+struct ctrl { uint32_t magic, staging_addr, stage1_len, stage1_crc32, app_base, desc_crc32; };
 #define APP_JUMP_ADDR    0x00002000u            /* alias; app is linked here */
 #define META_MAGIC       0x6E6B5542u            /* 'nkUB' - written only after a verified flash */
 
@@ -111,10 +169,14 @@ struct app_meta { uint32_t magic; uint32_t app_len; uint32_t app_crc32; };
 #define CMD_READ_STATUS  0x03
 #define CMD_VERIFY       0x04
 #define CMD_BOOT         0x05
+#define CMD_VERIFY_STAGE1 0x06   /* + crc32(4, LE): arm a stage-1 self-update (2.0.0) */
+#define CMD_GET_VERSION  0xB1    /* -> [proto, major, minor, patch, layout] (2.0.0)   */
 
 /* ---- state ---- */
 enum { BL_IDLE = 0, BL_BUSY = 1, BL_READY = 2, BL_ERROR = 3 };
-enum { ERR_NONE = 0, ERR_CRC = 5, ERR_REGION = 6 };
+/* 4/6/8 as in the I2C stage-1: 4 length invalid, 6 region / flash / BOOT with
+ * no valid app, 8 not a V203 layout-4 stage-1 image. */
+enum { ERR_NONE = 0, ERR_LEN = 4, ERR_CRC = 5, ERR_REGION = 6, ERR_NOT_STAGE1 = 8 };
 static uint8_t bl_state = BL_IDLE;
 static uint8_t bl_error = ERR_NONE;
 
@@ -327,17 +389,59 @@ static void write_byte(uint8_t b) {
     if (page_fill == FLASH_PAGE_LEN) flush_page();     /* full page -> burn it */
 }
 
-static void do_verify(uint32_t expected_crc) {
+/* Shared by VERIFY and VERIFY_STAGE1: flush the last partial page, then CRC
+ * what was written to the app/staging region. 1 = ok. */
+static int staged_ok(uint32_t expected_crc, uint32_t max_len) {
     /* flush the final partial page (0xFF-pad the unused tail so it programs to
      * erased/no-change) */
     if (page_fill) {
         for (uint32_t i = page_fill; i < FLASH_PAGE_LEN; i++) page_buf[i] = 0xFF;
         flush_page();
     }
-    if (!flash_ok) { bl_state = BL_ERROR; bl_error = ERR_REGION; return; }
+    if (!flash_ok) { bl_state = BL_ERROR; bl_error = ERR_REGION; return 0; }
+    if (total_written == 0 || total_written > max_len) { bl_state = BL_ERROR; bl_error = ERR_LEN; return 0; }
 
     uint32_t crc = crc32_calc((const uint8_t *)APP_FLASH_BASE, total_written);
-    if (crc != expected_crc) { bl_state = BL_ERROR; bl_error = ERR_CRC; return; }
+    if (crc != expected_crc) { bl_state = BL_ERROR; bl_error = ERR_CRC; return 0; }
+    return 1;
+}
+
+/* Arm a stage-1 self-update (2.0.0, DEV-237). The new stage-1 has been written
+ * to the app region exactly like an app. Only if the CRC matches AND the image
+ * carries a V203 layout-4 stage-1 header is the control block written; until
+ * then nothing is pending and an interrupted transfer just leaves no app. */
+static void do_verify_stage1(uint32_t expected_crc) {
+    if (!staged_ok(expected_crc, STAGE1_REGION_LEN)) return;
+
+    const volatile stage1_hdr_t *h = (const volatile stage1_hdr_t *)(APP_FLASH_BASE + HDR_OFFSET);
+    if (total_written < HDR_OFFSET + sizeof(stage1_hdr_t) ||
+        h->magic != HDR_MAGIC || h->base != 0x00000400u ||
+        h->layout != BL_LAYOUT || h->target != HDR_TARGET) {
+        bl_state = BL_ERROR; bl_error = ERR_NOT_STAGE1; return;
+    }
+
+    static uint32_t ctrl_page[FLASH_PAGE_LEN / 4];
+    for (uint32_t i = 0; i < FLASH_PAGE_LEN / 4; i++) ctrl_page[i] = 0xFFFFFFFFu;
+    ctrl_page[0] = CTRL_MAGIC;
+    ctrl_page[1] = APP_FLASH_BASE;      /* staging_addr */
+    ctrl_page[2] = total_written;       /* stage1_len   */
+    ctrl_page[3] = expected_crc;
+    ctrl_page[4] = APP_FLASH_BASE;      /* app_base - bounds the stage-1 region for stage-0 */
+    ctrl_page[5] = crc32_calc((const uint8_t *)ctrl_page, 20);   /* descriptor CRC */
+    flash_unlock();
+    flash_erase_page(CTRL_FLASH_ADDR);  /* ERASE wiped it already; a repeated VERIFY_STAGE1 must not program over old data */
+    flash_program_page(CTRL_FLASH_ADDR, ctrl_page);
+    if (!flash_ok) { bl_state = BL_ERROR; bl_error = ERR_REGION; return; }
+    bl_state = BL_READY; bl_error = ERR_NONE;
+}
+
+static int stage1_update_pending(void) {
+    return *(const volatile uint32_t *)CTRL_FLASH_ADDR == CTRL_MAGIC;
+}
+
+static void do_verify(uint32_t expected_crc) {
+    if (!staged_ok(expected_crc, APP_REGION_LEN)) return;
+    uint32_t crc = expected_crc;
 
     /* write metadata (validity marker) into its own 256-byte page. META_FLASH_ADDR
      * (0x7F00) is page-aligned + already erased by do_erase; program a full page
@@ -398,7 +502,28 @@ static void send_diagnostic(void) {
     USBD_SendEndpoint(3, r, 5);
 }
 
-static enum { P_CMD, P_WRITE_N, P_WRITE_DATA, P_VERIFY } pstate = P_CMD;
+/* 0xB1 GET_VERSION reply: [proto, major, minor, patch, layout] (2.0.0), the same
+ * 5 bytes as the I2C stage-1 - the brain reads the layout from byte 5. */
+static void send_version(void) {
+    uint8_t r[5] = { BL_PROTOCOL_VERSION, BL_VERSION_MAJOR, BL_VERSION_MINOR,
+                     BL_VERSION_PATCH, (uint8_t)BL_LAYOUT };
+    USBD_SendEndpoint(3, r, 5);
+}
+
+/* BOOT (2.0.0): a pending stage-1 update outranks the app (the app region holds
+ * the staged image) -> reset, stage-0 installs it. Otherwise only a VALID app
+ * is started; with none the module stays here with error 6 (1.x jumped blind). */
+static void do_boot(void) {
+    if (stage1_update_pending()) {
+        EXTEN->EXTEN_CTR &= ~EXTEN_USBD_PU_EN;   /* host sees the detach */
+        Delay_Ms(30);
+        NVIC_SystemReset();
+    }
+    if (app_is_valid()) jump_to_app();
+    bl_state = BL_ERROR; bl_error = ERR_REGION;
+}
+
+static enum { P_CMD, P_WRITE_N, P_WRITE_DATA, P_VERIFY, P_VERIFY_S1 } pstate = P_CMD;
 static uint8_t wr_remaining = 0;
 static uint8_t vbuf[4];
 static uint8_t vidx = 0;
@@ -411,7 +536,9 @@ static void process_byte(uint8_t b) {
                 case CMD_READ_STATUS:    send_status();               break;
                 case CMD_WRITE:          pstate = P_WRITE_N;          break;
                 case CMD_VERIFY:         vidx = 0; pstate = P_VERIFY;  break;
-                case CMD_BOOT:           jump_to_app();               break;  /* no return */
+                case CMD_BOOT:           do_boot();                   break;  /* no return unless no valid app */
+                case CMD_VERIFY_STAGE1:  vidx = 0; pstate = P_VERIFY_S1; break;
+                case CMD_GET_VERSION:    send_version();              break;
                 case CMD_GET_DIAGNOSTIC: send_diagnostic();           break;
                 default: break;
             }
@@ -426,11 +553,13 @@ static void process_byte(uint8_t b) {
             if (--wr_remaining == 0) { send_status(); pstate = P_CMD; }
             break;
         case P_VERIFY:
+        case P_VERIFY_S1:
             vbuf[vidx++] = b;
             if (vidx == 4) {
                 uint32_t crc = (uint32_t)vbuf[0] | ((uint32_t)vbuf[1] << 8)
                              | ((uint32_t)vbuf[2] << 16) | ((uint32_t)vbuf[3] << 24);
-                do_verify(crc);
+                if (pstate == P_VERIFY_S1) do_verify_stage1(crc);
+                else                       do_verify(crc);
                 send_status();
                 pstate = P_CMD;
             }

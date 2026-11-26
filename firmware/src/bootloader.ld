@@ -1,18 +1,21 @@
-/* noknok USB bootloader linker - CH32V203
- * Based on the ch32fun-generated CH32V203 linker, with two changes:
- *   - FLASH limited to the low 8 KB (the bootloader region); the application
- *     lives above it at 0x2000 and is flashed over USB.
- *   - RAM reduced by 16 B so the no-init handoff cell at 0x200027F0 sits ABOVE
- *     the stack and is never clobbered. The same address is valid in the app.
+/* noknok USB STAGE-1 linker - CH32V203, flash layout 4 (DEV-237)
+ * Based on the ch32fun-generated CH32V203 linker, with these changes:
+ *   - FLASH = the stage-1 region 0x0400-0x1FFF (7 KB), above the frozen 1 KB
+ *     stage-0. The application stays at 0x2000 (unchanged since 1.0).
+ *     0x0400 is 1 KB aligned (the vector table base, set by ch32fun into mtvec).
+ *   - a 20-byte image header at a FIXED base + 0x100, right after the vector
+ *     table: VERIFY_STAGE1 reads it in a STAGED image before arming stage-0.
+ *   - RAM reduced by 16 B so the no-init cells at 0x200027F0 (handoff, F4
+ *     diagnostic, F8 stage-0 attempts) sit ABOVE the stack.
  * Flash is addressed via the 0x00000000 alias (as ch32fun does for V20x).
  */
 
 ENTRY( InterruptVector )
 MEMORY
 {
-  FLASH (rx) : ORIGIN = 0x00000000, LENGTH = 8K       /* 8 KB bootloader region        */
+  FLASH (rx) : ORIGIN = 0x00000400, LENGTH = 7K       /* stage-1 region                */
   EXT (rx)   : ORIGIN = 0x08008000, LENGTH = 192K     /* extended flash (unused here)  */
-  RAM (xrw)  : ORIGIN = 0x20000000, LENGTH = 10224    /* 10 KB - 16 B (handoff cell)   */
+  RAM (xrw)  : ORIGIN = 0x20000000, LENGTH = 10224    /* 10 KB - 16 B (no-init cells)  */
 }
 SECTIONS
 {
@@ -24,6 +27,12 @@ SECTIONS
    . = ALIGN(4);
    _einit = .;
   } >FLASH AT>FLASH
+  /* Explicit AT(): "AT>FLASH" would continue the load address from the end of
+   * .init and put the header at the wrong file offset (I2C stage-1 lesson). */
+  .stage1_hdr ORIGIN(FLASH) + 0x100 : AT(ORIGIN(FLASH) + 0x100)
+  {
+   KEEP(*(.stage1_hdr))
+  } >FLASH
   .text :
   {
    . = ALIGN(4);
@@ -130,3 +139,7 @@ SECTIONS
    *(.ARM.exidx*)
   }
 }
+ASSERT( ORIGIN(FLASH) == 0x400 && (ADDR(.init) & 0x3FF) == 0, "stage-1 vector table must sit at 0x400 (1 KB aligned)" )
+ASSERT( SIZEOF(.init) <= 0x100, "vector table has grown into the stage-1 header slot" )
+ASSERT( ADDR(.stage1_hdr) == 0x500 && LOADADDR(.stage1_hdr) == 0x500 && SIZEOF(.stage1_hdr) == 20,
+        "stage-1 header must be 20 bytes at base + 0x100" )

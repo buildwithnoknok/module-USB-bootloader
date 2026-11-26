@@ -23,10 +23,14 @@ firmware** so OTA could ride it for free — it is **not reachable**:
 So we own the bootloader. Entry uses the **magic-in-RAM + warm reset** pattern
 (same as the I2C modules), which is proven to work on this chip.
 
-## Layout 4: frozen stage-0 + updatable stage-1 (2.0.0, DEV-237, not released yet)
+## Layout 4: frozen stage-0 + updatable stage-1 (2.0.0, DEV-237)
 
-> **Status:** source on branch `dev-237-v203-stage0-stage1`, built and host-checked,
-> **not bench-tested, not released.** `firmware/bin/` still holds the single-stage 1.1.0.
+> **Status:** release candidate on branch `dev-237-v203-stage0-stage1`, bench-tested on a
+> LEDs 16x (SWD + USB, power cuts, wrong-file refusals, retention). It becomes the release
+> when the branch is merged to `main`. Release files: `firmware/bin/noknok_usb_stage0.bin`
+> (712 B), `firmware/bin/noknok_usb_stage1.bin` (2.0.0, 5568 B, crc32 `e5fbbc0a`) and the
+> stage-1 index `firmware/index_v203.json`. `firmware/bin/noknok_usb_bootloader.bin` stays the
+> single-stage 1.1.0 for modules that have not had their one-time full-image flash yet.
 
 Since 2.0.0 the bootloader is split like the I2C one, so a bootloader bug can be fixed
 over USB instead of re-flashing every module with the jumper:
@@ -50,6 +54,14 @@ VERIFY_STAGE1. BOOT with no valid app now stays in the bootloader with error 6 (
 flashed with ONE full image via the BOOT0 jumper + WCHISPTool (or SWD):
 `python tools/mk_full_v203.py stage0.bin stage1.bin app.bin full.bin` (`--check` re-validates).
 A 1.x bootloader cannot install stage-0 itself (it never writes below `0x2000`).
+
+**Bench tests (Pi4 host, module on a Pi USB port + WCH-LinkE on its 4-pad SWD):**
+`firmware/stage0/test/run_s0_tests.sh` (stage-0 over SWD: armed install, a copy cut half-way,
+bad descriptor / image CRC / geometry refused) and `tools/bench/dev237_bench.py` (over USB:
+0xB1, app OTA, stage-1 self-update both ways, ganged power cuts at each step, wrong-file and
+no-app refusals, app retention over power cuts; `uhubctl` needs root, the sudo password comes
+from the environment variable `BENCH_SUDO_PW`). A power cut from `uhubctl` takes ~2 s to land,
+so a cut *inside* the stage-0 copy is covered by the SWD test, not the USB one.
 
 ## Flash map up to 1.1.0 (single stage; 32 KB, flash at `0x08000000`, also aliased at `0x00000000`)
 
@@ -79,14 +91,17 @@ unique chip-UID serial as the app — so the host can match a module across both
 
 | Cmd | Bytes | Action |
 |-----|-------|--------|
-| `0x01` ERASE | `01` | erase the app + metadata region (1 KB pages) |
-| `0x02` WRITE | `02 n <n bytes>` | append `n` app bytes (programmed as 16-bit halfwords) |
+| `0x01` ERASE | `01` | erase the app + metadata region (256 B pages; 2.0.0 also the control block) |
+| `0x02` WRITE | `02 n <n bytes>` (n ≤ 32) | append `n` bytes; buffered and burnt as whole 256 B pages (fast page program, read back per page) |
 | `0x03` READ_STATUS | `03` | reply `[state, err]` |
 | `0x04` VERIFY | `04 crc32(4, LE)` | CRC-check the written app; write metadata **only on match** |
-| `0x05` BOOT | `05` | jump to the application (no reply) |
+| `0x05` BOOT | `05` | start the app (no reply). 2.0.0: a pending stage-1 update resets instead (stage-0 installs it); with no valid app the module stays here, error 6 |
+| `0x06` VERIFY_STAGE1 | `06 crc32(4, LE)` | 2.0.0: CRC-check the written image as a **stage-1** and arm the update; error 8 if it is not a V203 layout-4 stage-1, error 4 if it is larger than the 7 KB stage-1 region |
+| `0xB1` GET_VERSION | `B1` | 2.0.0: reply `[proto, major, minor, patch, layout]`, e.g. `01 02 00 00 04`; 1.x does not answer |
 | `0xB2` GET_DIAGNOSTIC | `B2` | reply `[branch, rstsckr(4, LE)]` — see [Diagnosing a bootloader entry](#diagnosing-a-bootloader-entry) below |
 
-`state`: 0 IDLE, 1 BUSY, 2 READY, 3 ERROR. `err`: 0 ok, 5 CRC mismatch, 6 region overflow.
+`state`: 0 IDLE, 1 BUSY, 2 READY, 3 ERROR. `err`: 0 ok, 4 length invalid, 5 CRC mismatch,
+6 region / flash error or BOOT with no valid app, 8 not a V203 layout-4 stage-1 image.
 
 ## Brick safety
 

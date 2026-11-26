@@ -5,19 +5,35 @@ here. This versioning is **independent of the module application firmware** (e.g
 `module-usb-led`) — it tracks the bootloader binary only. The version is set by
 `BL_VERSION_{MAJOR,MINOR,PATCH}` in `firmware/src/noknok_usb_bootloader.c`.
 
-> **The bootloader is not updated over the air.** It is flashed **once per board**
-> via BOOT0 + WCHISPTool; OTA writes only the application region (`0x08002000`+),
-> never the bootloader's own region (`0x08000000`). A bootloader change therefore
-> requires a physical re-flash of every affected module.
+> **Up to 1.1.0 the bootloader is not updated over the air.** It is flashed **once per
+> board** via BOOT0 + WCHISPTool; OTA writes only the application region (`0x08002000`+).
+> **From 2.0.0 (flash layout 4)** the bootloader is split into a frozen stage-0 and a
+> stage-1 that updates itself over USB; getting stage-0 onto a module still takes one
+> full-image flash (BOOT0 + WCHISPTool, or SWD).
 
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [2.0.0] — 2026-11-20 — NOT RELEASED (branch `dev-237-v203-stage0-stage1`)
+## [2.0.0] — 2026-11-26 — release candidate (branch `dev-237-v203-stage0-stage1`, released when merged to `main`)
+
+Release files: `firmware/bin/noknok_usb_stage0.bin` (712 B, crc32 `539c3cf9`),
+`firmware/bin/noknok_usb_stage1.bin` (5568 B, crc32 `e5fbbc0a`), stage-1 index
+`firmware/index_v203.json` (layout 4). Built with the bench toolchain (gcc 14.2.0), which
+rebuilds 1.1.0 byte-identical.
+
+Bench 26 Nov 2026 (Pi4 host, LEDs 16x on a Pi USB port + WCH-LinkE on SWD, `tools/bench/dev237_bench.py`,
+18/18 PASS): layout-4 full image over SWD boots the app; `0xB1` = `(1,2,0,0,4)`; app OTA through stage-1 2.0.0;
+the OTA-written app survives 10/10 power cuts; stage-1 self-update 2.0.0 -> 2.0.1 -> 2.0.0 with the app pushed
+after each; power cut mid-WRITE (old stage-1, flash mode), after VERIFY_STAGE1 before BOOT (stage-0 installs the
+new stage-1 at power-on), after BOOT (new stage-1) and with the bootloader idle (unchanged); every such cut read
+PORRSTF in `0xB2`. VERIFY_STAGE1 refuses a V003 stage-1, an X035 stage-1 and the 1.1.0 bootloader (error 8) and
+an app image (error 4, larger than the stage-1 region); nothing is armed, BOOT then stays in the bootloader.
+BOOT without a valid app stays in the bootloader with error 6. `usb_flash.py` now asks `0xB1` up to 3 times (one
+empty first read seen right after the bootloader enumerated).
 
 ### Changed (breaking: new flash layout 4, one full-image re-flash per module)
 - **DEV-237 — the bootloader is now field-updatable.** Split like the I2C bootloader:
-  a new frozen **stage-0** (`firmware/stage0/`, 740 B of 1 KB, no USB) at `0x0000`, and
-  this CDC bootloader relinked as **stage-1** at `0x0400` (7 KB region, 5576 B). The app
+  a new frozen **stage-0** (`firmware/stage0/`, 712 B of 1 KB, no USB) at `0x0000`, and
+  this CDC bootloader relinked as **stage-1** at `0x0400` (7 KB region, 5568 B). The app
   base stays `0x2000`, so the LED apps run unchanged; the app region shrinks by the new
   control-block page `0x7E00` (23.5 KB, apps today are 6-9 KB).
 - New `0x06 VERIFY_STAGE1 crc32` (stage-1 self-update, header + chip guard: error 8 for an
@@ -26,9 +42,6 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
   BOOT reset so stage-0 installs it.
 - Tools: `usb_flash.py --stage1`, new `mk_full_v203.py` (layout-4 full image + `--check`).
 
-The above "not updated over the air" note is true up to 1.1.0 only. Sizes are from the
-agent-hq toolchain (gcc 14.2, ch32fun 95030fd), which does not reproduce the released 1.1.0
-byte for byte (5156 vs 5148 B); the release build comes from the bench toolchain.
 Bench 22 Nov 2026 (cellar rig, LEDs 16x on the WCH-LinkE, bench toolchain; main 1.1.0 rebuilds byte-identical;
 release sizes stage-0 712 B, stage-1 2.0.0 5568 B): stage-0 SWD tests `firmware/stage0/test/run_s0_tests.sh` 6/6 PASS
 (armed update installed, a copy cut half-way redone, bad descriptor / bad image CRC / bad geometry refused with the

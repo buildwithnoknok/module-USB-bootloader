@@ -58,11 +58,17 @@ def status(s, what):
 
 
 def get_version(s):
-    """0xB1 -> (proto, major, minor, patch, layout); stage-1 >= 2.0.0 only (1.x ignores it)."""
-    s.reset_input_buffer()
-    s.write(b"\xB1"); s.flush()
-    r = s.read(5)
-    return tuple(r) if len(r) == 5 else None
+    """0xB1 -> (proto, major, minor, patch, layout); stage-1 >= 2.0.0 only (1.x ignores it).
+    Asked up to 3 times: right after the bootloader enumerates, the first read can come back
+    empty (seen once on the bench, DEV-237 26 Nov 2026), and one miss must not read as "1.x"."""
+    for _ in range(3):
+        s.reset_input_buffer()
+        s.write(b"\xB1"); s.flush()
+        r = s.read(5)
+        if len(r) == 5:
+            return tuple(r)
+        time.sleep(0.2)
+    return None
 
 
 def main():

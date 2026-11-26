@@ -1,0 +1,11 @@
+{
+  "format": 1,
+  "component": "stage1",
+  "chip": "CH32V203",
+  "version": "2.0.0",
+  "url": "https://raw.githubusercontent.com/buildwithnoknok/module-USB-bootloader/main/firmware/bin/noknok_usb_stage1.bin",
+  "layout": 4,
+  "size": 5568,
+  "crc32": "e5fbbc0a",
+  "released": "2026-11-26"
+}

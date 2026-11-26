@@ -63,6 +63,10 @@ no-app refusals, app retention over power cuts; `uhubctl` needs root, the sudo p
 from the environment variable `BENCH_SUDO_PW`). A power cut from `uhubctl` takes ~2 s to land,
 so a cut *inside* the stage-0 copy is covered by the SWD test, not the USB one.
 
+**Test stage-1 2.0.1** (version bump only, NOT a release): `firmware/test/stage1_2.0.1/` holds the
+binary and its own `index_v203_test.json`, so an update path (a Pi with `usb_flash.py --stage1`, or
+a brain with a bench registry override) has something newer than 2.0.0 to install. See the README there.
+
 ## Flash map up to 1.1.0 (single stage; 32 KB, flash at `0x08000000`, also aliased at `0x00000000`)
 
 | Region | Address | Notes |

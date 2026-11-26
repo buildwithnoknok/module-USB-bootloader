@@ -42,6 +42,11 @@ empty first read seen right after the bootloader enumerated).
   BOOT reset so stage-0 installs it.
 - Tools: `usb_flash.py --stage1`, new `mk_full_v203.py` (layout-4 full image + `--check`).
 
+### Test artifact (not a release, no version bump)
+- `firmware/test/stage1_2.0.1/`: stage-1 **2.0.1** (5572 B, crc32 `dc791dc1`), the 2.0.0 source with
+  only the patch byte changed, plus its own `index_v203_test.json`. It gives a brain's USB stage-1
+  update pass (DEV-298) something to install; it never goes to `firmware/bin/` or the registry.
+
 Bench 22 Nov 2026 (cellar rig, LEDs 16x on the WCH-LinkE, bench toolchain; main 1.1.0 rebuilds byte-identical;
 release sizes stage-0 712 B, stage-1 2.0.0 5568 B): stage-0 SWD tests `firmware/stage0/test/run_s0_tests.sh` 6/6 PASS
 (armed update installed, a copy cut half-way redone, bad descriptor / bad image CRC / bad geometry refused with the
